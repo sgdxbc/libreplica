@@ -14,7 +14,7 @@ pub trait Replica<App> {
     fn execute_unlogged(&mut self, req: impl Req, reply: &mut impl Reply);
 }
 /// `Replica` function is decoupled with its state. Funny.
-impl<T: ?Sized + App<A>, A> Replica<A> for T {
+impl<T: App<A>, A> Replica<A> for T {
     fn execute(&mut self, op_num: OpNum, mut req: impl Req, reply: &mut impl Reply) {
         debug!("replica upcall: num = {}, op = {}", op_num, req.get_op());
         reply.set_result(self.replica_upcall(op_num, req.take_op()));

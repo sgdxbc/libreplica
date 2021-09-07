@@ -1,17 +1,10 @@
 //!
-// [libreplica] 280 lines (this file only)
-// [specpaxos] 309 lines
-//   unreplicated-proto.proto: 21
-//   client.h: 47
-//   client.cc: 132
-//   replica.h: 29
-//   replica.cc: 80
-// C++ sucks
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use derivative::Derivative;
 use log::*;
+use serde_derive::{Deserialize, Serialize};
 
 use crate::util::*;
 use crate::*;
@@ -19,9 +12,11 @@ use crate::*;
 mod msg {
     use std::mem::take;
 
+    use serde_derive::{Deserialize, Serialize};
+
     use crate::util;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Deserialize, Serialize)]
     pub struct Req {
         pub op: String,
         pub seq: u64,
@@ -34,7 +29,7 @@ mod msg {
             take(&mut self.op)
         }
     }
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone, Default, Deserialize, Serialize)]
     pub struct Reply {
         pub result: String,
         pub seq: u64,
@@ -44,7 +39,7 @@ mod msg {
             self.result = result;
         }
     }
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Deserialize, Serialize)]
     pub struct UnloggedReq {
         pub op: String,
     }
@@ -56,7 +51,7 @@ mod msg {
             take(&mut self.op)
         }
     }
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone, Default, Deserialize, Serialize)]
     pub struct UnloggedReply {
         pub result: String,
     }
@@ -66,7 +61,7 @@ mod msg {
         }
     }
 }
-#[derive(Clone, Derivative)]
+#[derive(Clone, Derivative, Deserialize, Serialize)]
 #[derivative(Debug)]
 pub enum Msg {
     #[derivative(Debug = "transparent")]
@@ -106,12 +101,12 @@ impl<T: Client> Default for ClientState<T> {
 impl<T: Client> crate::ClientState for ClientState<T> {}
 impl<T: Client> Invoke<Unreplicated> for T {
     fn invoke(&mut self, op: String) -> Reliable<String> {
-        assert!(self.get_mut().req.is_none(), "one request at a time");
+        assert!(self.borrow_mut().req.is_none(), "one request at a time");
         let (out, fut) = reliable();
-        self.get_mut().seq += 1;
-        self.get_mut().req = Some(PendingReq {
+        self.borrow_mut().seq += 1;
+        self.borrow_mut().req = Some(PendingReq {
             op,
-            seq: self.get_mut().seq,
+            seq: self.borrow_mut().seq,
             out,
         });
         self.send_req();
@@ -119,11 +114,11 @@ impl<T: Client> Invoke<Unreplicated> for T {
     }
     fn invoke_unlogged(&mut self, op: String, timeout: Millis) -> Unreliable<String> {
         assert!(
-            self.get_mut().unlogged_req.is_none(),
+            self.borrow_mut().unlogged_req.is_none(),
             "one unlogged request at a time"
         );
         let (out, fut) = unreliable();
-        self.get_mut().unlogged_req = Some(PendingUnlogged(out));
+        self.borrow_mut().unlogged_req = Some(PendingUnlogged(out));
         let msg = msg::UnloggedReq { op };
         self.send_msg_to_replica(0, Msg::UnloggedReq(msg));
         self.unlogged_timer().interval = timeout;
@@ -152,25 +147,25 @@ pub trait Client:
     Transport<Msg = Msg> + TimerKit + TaggedBorrowMut<ClientState<Self>, { Role::Client as u8 }>
 {
     fn req_timer(&mut self) -> &mut TimerState<Self> {
-        &mut self.get_mut().req_timer
+        &mut self.borrow_mut().req_timer
     }
     fn unlogged_timer(&mut self) -> &mut TimerState<Self> {
-        &mut self.get_mut().unlogged_timer
+        &mut self.borrow_mut().unlogged_timer
     }
 
     fn on_req(&mut self) {
-        warn!("resend request: seq = {}", self.get_mut().seq);
+        warn!("resend request: seq = {}", self.borrow_mut().seq);
         self.send_req();
     }
     fn on_unlogged(&mut self) {
         warn!("unlogged request timeout");
-        self.get_mut().unlogged_req.take(); // drop the pipe to cancel
+        self.borrow_mut().unlogged_req.take(); // drop the pipe to cancel
         self.stop(Self::unlogged_timer);
     }
 
     fn handle_reply(&mut self, _remote: &SocketAddr, msg: msg::Reply) {
         if self
-            .get_mut()
+            .borrow_mut()
             .req
             .as_ref()
             .map(|req| req.seq != msg.seq)
@@ -179,11 +174,11 @@ pub trait Client:
             return;
         }
         self.stop(Self::req_timer);
-        let req = self.get_mut().req.take().unwrap();
+        let req = self.borrow_mut().req.take().unwrap();
         req.out.send(msg.result).unwrap();
     }
     fn handle_unlogged_reply(&mut self, _remote: &SocketAddr, msg: msg::UnloggedReply) {
-        let req = self.get_mut().unlogged_req.take();
+        let req = self.borrow_mut().unlogged_req.take();
         if req.is_none() {
             return;
         }
@@ -192,8 +187,8 @@ pub trait Client:
 
     fn send_req(&mut self) {
         let msg = msg::Req {
-            op: self.get_mut().req.as_ref().unwrap().op.to_string(),
-            seq: self.get_mut().seq,
+            op: self.borrow_mut().req.as_ref().unwrap().op.to_string(),
+            seq: self.borrow_mut().seq,
         };
         self.send_msg_to_replica(0, Msg::Req(msg));
         self.reset(Self::req_timer);
@@ -241,7 +236,7 @@ where
     }
 }
 impl<
-        T: Transport<Msg = Msg> + TaggedBorrowMut<ServerState<T, A>, { Role::Server as u8 }>,
+        T: TransportCore<Msg = Msg> + TaggedBorrowMut<ServerState<T, A>, { Role::Server as u8 }>,
         A: AppMeta,
     > Server<A> for T
 where
@@ -249,13 +244,12 @@ where
 {
 }
 pub trait Server<A: AppMeta>:
-    Transport<Msg = Msg> + TaggedBorrowMut<ServerState<Self, A>, { Role::Server as u8 }>
+    TransportCore<Msg = Msg> + TaggedBorrowMut<ServerState<Self, A>, { Role::Server as u8 }>
 where
     ServerState<Self, A>: App<A>,
 {
     fn handle_req(&mut self, remote: &SocketAddr, msg: msg::Req) {
-        if let Some(reply_msg) = self.get_mut().client_table.get(remote) {
-            info!("duplicated request from {}...", remote);
+        if let Some(reply_msg) = self.borrow_mut().client_table.get(remote) {
             let last_seq = reply_msg.seq;
             if last_seq == msg.seq {
                 info!("resend last request");
@@ -263,24 +257,25 @@ where
                 self.send_msg(remote, Msg::Reply(reply_msg));
             }
             if last_seq >= msg.seq {
+                info!("skip duplicated request");
                 return;
             }
         }
-        self.get_mut().op_num += 1;
+        self.borrow_mut().op_num += 1;
         let mut reply_msg = msg::Reply {
             seq: msg.seq,
             ..Default::default()
         };
-        let op_num = self.get_mut().op_num;
-        self.get_mut().execute(op_num, msg, &mut reply_msg);
-        self.get_mut()
+        let op_num = self.borrow_mut().op_num;
+        self.borrow_mut().execute(op_num, msg, &mut reply_msg);
+        self.borrow_mut()
             .client_table
-            .insert(remote.clone(), reply_msg.clone());
+            .insert(*remote, reply_msg.clone());
         self.send_msg(remote, Msg::Reply(reply_msg));
     }
     fn handle_unlogged_req(&mut self, remote: &SocketAddr, msg: msg::UnloggedReq) {
         let mut reply_msg = msg::UnloggedReply::default();
-        self.get_mut().execute_unlogged(msg, &mut reply_msg);
+        self.borrow_mut().execute_unlogged(msg, &mut reply_msg);
         self.send_msg(remote, Msg::UnloggedReply(reply_msg));
     }
 }
@@ -298,7 +293,7 @@ mod tests {
     use simple_logger::SimpleLogger;
 
     use super::*;
-    use crate::app::mock::{App as Mock, AppState};
+    use crate::app::mock::{App as Mock, AppState, Upcall};
     use crate::engine::sim::*;
     fn setup(nb_client: u64) -> (Engine<Unreplicated, Mock>, Vec<SocketAddr>) {
         let _ = SimpleLogger::new().with_level(LevelFilter::Debug).init();
@@ -340,9 +335,20 @@ mod tests {
                 task.invoke(client, "Hello (again)".to_string()).await,
                 "Reply: Hello (again)"
             );
+
+            let step = task.spawn(|engine| {
+                assert_eq!(
+                    *engine.app(0),
+                    AppState(vec![
+                        Upcall::ReplicaUpcall(1, "Hello".to_string()),
+                        Upcall::ReplicaUpcall(2, "Hello (again)".to_string()),
+                    ])
+                );
+                async {}
+            });
+            step.await;
         });
         assert!(engine.run());
-        // TODO check app state
     }
 
     #[test]
@@ -362,6 +368,14 @@ mod tests {
                 .await,
                 Ok("Unlogged reply: Hello".to_string())
             );
+            task.spawn(|engine| {
+                assert_eq!(
+                    *engine.app(0),
+                    AppState(vec![Upcall::UnloggedUpcall("Hello".to_string())])
+                );
+                async {}
+            })
+            .await;
         });
         assert!(engine.run());
     }
@@ -374,11 +388,11 @@ mod tests {
         });
         engine.sched(|task| async move {
             let addr = client_list[0];
-            let step = task.clone().spawn(move |engine| {
+            task.spawn(move |engine| {
                 engine.add_filter(1, Filter::from(|_: &mut MsgEnvelop<_>| false));
                 engine.client(&addr).invoke("Never done".to_string())
-            });
-            step.await;
+            })
+            .await;
         });
         assert!(!engine.run());
     }
@@ -406,25 +420,25 @@ mod tests {
     fn resend() {
         let (mut engine, client_list) = setup(1);
         engine.sched(|task| async move {
-            let step = task.clone().spawn(move |engine| {
+            task.spawn(move |engine| {
                 engine.add_filter(1, Filter::from(|_: &mut MsgEnvelop<_>| false));
                 engine.sleep(1)
-            });
-            step.await;
-            let step = task.clone().spawn(move |engine| {
+            })
+            .await;
+            task.spawn(move |engine| {
                 engine.remove_filter(1);
                 async {}
-            });
-            step.await;
+            })
+            .await;
             task.cancel_all_timeout(1000).await;
         });
         engine.sched(|task| async move {
             let addr = client_list[0];
-            let step = task.clone().spawn(move |engine| {
+            task.spawn(move |engine| {
                 engine.add_filter(1, Filter::from(|_: &mut MsgEnvelop<_>| false));
                 engine.client(&addr).invoke("Hello (resend)".to_string())
-            });
-            step.await;
+            })
+            .await;
         });
         assert!(engine.run());
     }
@@ -434,19 +448,19 @@ mod tests {
         let (mut engine, client_list) = setup(1);
         let client = client_list[0].clone();
         engine.sched(|task| async move {
-            let step = task.clone().spawn(move |engine| {
+            task.spawn(move |engine| {
                 engine.add_filter(
                     1,
                     Filter::from(move |envelop: &mut MsgEnvelop<_>| envelop.dst != client),
                 );
                 engine.sleep(1)
-            });
-            step.await;
-            let step = task.clone().spawn(move |engine| {
+            })
+            .await;
+            task.spawn(move |engine| {
                 engine.remove_filter(1);
                 async {}
-            });
-            step.await;
+            })
+            .await;
             task.cancel_all_timeout(1000).await;
         });
         engine.sched(|task| async move {
@@ -455,8 +469,12 @@ mod tests {
                     .await,
                 "Reply: Hello (duplicated)"
             );
+            task.spawn(|engine| {
+                assert_eq!(engine.app(0).0.len(), 1);
+                async {}
+            })
+            .await;
         });
         assert!(engine.run());
-        // TODO check app state
     }
 }

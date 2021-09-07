@@ -5,9 +5,11 @@ pub mod recv {
 }
 pub mod engine {
     pub mod sim;
+    pub mod udp;
 }
 pub mod app {
     pub(crate) mod mock;
+    pub mod null;
 }
 pub(crate) mod util {
     pub mod timer;
@@ -22,9 +24,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::channel::oneshot::{
-    channel as unreliable, Canceled, Receiver as Unreliable, Sender as Out,
-};
+pub use futures::channel::oneshot::Canceled;
+use futures::channel::oneshot::Receiver as Unreliable;
+pub(crate) use futures::channel::oneshot::{channel as unreliable, Sender as Out};
 
 pub type OpNum = u64;
 
@@ -40,6 +42,9 @@ pub trait AppMeta {
     type State;
 }
 /// Grouped meta for `ClientState` and `ServerState`, include useful `Msg`.
+///
+/// Although not related, the engine and app types are tagged, because most
+/// client and server's states types need to be construct with them.
 pub trait Protocol<Engine, App> {
     type Client;
     type Server;
@@ -49,10 +54,10 @@ pub trait Protocol<Engine, App> {
 /// parameters or trait's associate type. Include a tag to prevent these
 /// implementations collide with each other.
 ///
-/// The tag is not contraint. Currently only roles are used as tags, but it could
-/// be extended some time.
+/// The value of tag is unlimited. Currently only roles are used as tags, but it
+/// could be extended some time.
 pub trait TaggedBorrowMut<T, const TAG: u8> {
-    fn get_mut(&mut self) -> &mut T;
+    fn borrow_mut(&mut self) -> &mut T;
 }
 
 pub type ReplicaIndex = i32;
@@ -63,7 +68,10 @@ pub struct ReplicaState<App: AppMeta> {
 }
 
 pub trait ClientState: Default {}
-pub trait ServerState<App: AppMeta>: From<ReplicaState<App>> {}
+pub trait ServerState<App: AppMeta>:
+    From<ReplicaState<App>> + BorrowMut<ReplicaState<App>>
+{
+}
 
 pub struct Config {
     pub f: usize,

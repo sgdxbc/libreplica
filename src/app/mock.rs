@@ -2,7 +2,9 @@
 
 use crate::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState(pub Vec<Upcall>);
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Upcall {
     ReplicaUpcall(OpNum, String),
     UnloggedUpcall(String),

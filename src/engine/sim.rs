@@ -3,7 +3,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -17,13 +16,12 @@ use log::*;
 use crate::*;
 
 pub struct Engine<P: Protocol<Self, App>, App> {
-    _p: PhantomData<P>,
     recv_map: HashMap<SocketAddr, RecvState<Self, P, App>>,
     whoami: Option<SocketAddr>,
 
     msg_in: Sender<MsgEnvelop<P::Msg>>,
     msg_out: Receiver<MsgEnvelop<P::Msg>>,
-    filter_map: HashMap<u64, Box<dyn Fn(&mut MsgEnvelop<P::Msg>) -> bool>>,
+    filter_map: HashMap<u64, NativeFilter<P::Msg>>,
 
     now: Millis,
     timeout_queue: BinaryHeap<Reverse<TimeoutState<Self>>>,
@@ -39,6 +37,7 @@ enum RecvState<E, P: Protocol<E, A>, A> {
     Client(P::Client),
     Server(P::Server),
 }
+pub type NativeFilter<Msg> = Box<dyn Fn(&mut MsgEnvelop<Msg>) -> bool>;
 type Step<E> = Box<dyn FnOnce(&mut E) -> LocalBoxFuture<'static, ()>>;
 #[derive(Derivative)]
 #[derivative(Eq, PartialEq, Ord, PartialOrd)]
@@ -68,7 +67,6 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
         let (msg_in, msg_out) = channel();
         let (step_in, step_out) = channel();
         Self {
-            _p: PhantomData,
             recv_map: HashMap::new(),
             whoami: None,
             msg_in,
@@ -105,7 +103,7 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
 }
 
 impl<P: Protocol<Self, A>, A> TaggedBorrowMut<P::Client, { Role::Client as u8 }> for Engine<P, A> {
-    fn get_mut(&mut self) -> &mut P::Client {
+    fn borrow_mut(&mut self) -> &mut P::Client {
         if let RecvState::Client(state) = self.recv_map.get_mut(&self.whoami.unwrap()).unwrap() {
             state
         } else {
@@ -114,7 +112,7 @@ impl<P: Protocol<Self, A>, A> TaggedBorrowMut<P::Client, { Role::Client as u8 }>
     }
 }
 impl<P: Protocol<Self, A>, A> TaggedBorrowMut<P::Server, { Role::Server as u8 }> for Engine<P, A> {
-    fn get_mut(&mut self) -> &mut P::Server {
+    fn borrow_mut(&mut self) -> &mut P::Server {
         if let RecvState::Server(state) = self.recv_map.get_mut(&self.whoami.unwrap()).unwrap() {
             state
         } else {
@@ -180,7 +178,7 @@ impl<P: Protocol<Self, A>, A> Timing for Engine<P, A> {
         self.enable_set.remove(&timeout);
     }
 }
-
+// everything following is exclusive features of simulated engine
 impl<P: Protocol<Self, A>, A> Engine<P, A> {
     pub fn client(&mut self, addr: &SocketAddr) -> &mut impl Invoke<P>
     where
@@ -189,7 +187,20 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
         self.whoami = Some(*addr);
         self
     }
-    pub fn sleep(&mut self, duration: Millis) -> Reliable<()> {
+    pub fn app(&mut self, index: ReplicaIndex) -> &mut A::State
+    where
+        A: AppMeta,
+        P::Server: ServerState<A>,
+    {
+        let addr = self.config.replica_list[index as usize];
+        let state = if let RecvState::Server(state) = self.recv_map.get_mut(&addr).unwrap() {
+            state
+        } else {
+            unreachable!()
+        };
+        &mut state.borrow_mut().app
+    }
+    pub fn sleep(&mut self, duration: Millis) -> impl Future<Output = ()> {
         let (out, fut) = reliable();
         self.whoami = None;
         self.create_timeout(duration, |_| out.send(()).unwrap());
@@ -201,7 +212,7 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
     }
 }
 pub enum Filter<Msg> {
-    Native(Box<dyn Fn(&mut MsgEnvelop<Msg>) -> bool>),
+    Native(NativeFilter<Msg>),
     All,
 }
 impl<Msg, F: 'static + Fn(&mut MsgEnvelop<Msg>) -> bool> From<F> for Filter<Msg> {
@@ -230,11 +241,11 @@ impl<E> Clone for Spawner<E> {
 }
 impl<E> Spawner<E> {
     // FIXME(generators)
-    // although `yield` probably cannot do a in-place replacing
-    pub async fn spawn<T: 'static, Fut: 'static + Future<Output = T>>(
-        self,
+    // although `yield` probably cannot do an in-place replacing
+    pub fn spawn<T: 'static, Fut: 'static + Future<Output = T>>(
+        &self,
         step: impl 'static + FnOnce(&mut E) -> Fut,
-    ) -> T {
+    ) -> impl Future<Output = T> {
         let (t_in, t_out) = reliable();
         let step = Box::new(|this: &mut E| -> LocalBoxFuture<'static, ()> {
             let pending = step(this);
@@ -243,17 +254,22 @@ impl<E> Spawner<E> {
             })
         });
         self.0.send(step).unwrap();
-        t_out.await
+        t_out
     }
 }
+// shortcuts for one single async operation as a step
 impl<P: Protocol<Engine<P, A>, A>, A> Spawner<Engine<P, A>> {
-    pub async fn invoke(&self, addr: &SocketAddr, op: String) -> String
+    pub async fn invoke(
+        &self,
+        addr: &SocketAddr,
+        op: String,
+        // some kind of stupid...
+    ) -> <Reliable<String> as Future>::Output
     where
         Engine<P, A>: Invoke<P>,
     {
         let addr = *addr;
-        self.clone()
-            .spawn(move |engine| engine.client(&addr).invoke(op))
+        self.spawn(move |engine| engine.client(&addr).invoke(op))
             .await
     }
     pub async fn invoke_unlogged(
@@ -261,28 +277,30 @@ impl<P: Protocol<Engine<P, A>, A>, A> Spawner<Engine<P, A>> {
         addr: &SocketAddr,
         op: String,
         timeout: Millis,
-    ) -> Result<String, Canceled>
+    ) -> <Unreliable<String> as Future>::Output
     where
         Engine<P, A>: Invoke<P>,
     {
         let addr = *addr;
-        self.clone()
-            .spawn(move |engine| engine.client(&addr).invoke_unlogged(op, timeout))
+        self.spawn(move |engine| engine.client(&addr).invoke_unlogged(op, timeout))
             .await
     }
-    pub async fn sleep(&self, duration: Millis) {
-        self.clone()
-            .spawn(move |engine| engine.sleep(duration))
-            .await
+    pub async fn sleep(&self, duration: Millis)
+    where
+        Self: 'static,
+    {
+        self.spawn(move |engine| engine.sleep(duration)).await
     }
-    pub async fn cancel_all_timeout(&self, after: Millis) {
+    pub async fn cancel_all_timeout(&self, after: Millis)
+    where
+        Self: 'static,
+    {
         self.sleep(after).await;
-        self.clone()
-            .spawn(|engine| {
-                engine.cancel_all_timeout();
-                async {}
-            })
-            .await;
+        self.spawn(|engine| {
+            engine.cancel_all_timeout();
+            async {}
+        })
+        .await;
     }
 }
 impl<P: Protocol<Self, A>, A> Engine<P, A> {
@@ -332,7 +350,7 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
                 assert!(self.step_out.try_recv().is_err()); // task should wait on step
                 return true;
             }
-            // step 2, extend task list with collected steps
+            // step 2, execute collected steps, make them into tasks
             let step_list: Vec<_> = self.step_out.try_iter().collect();
             let step_task: Vec<_> = step_list.into_iter().map(|step| step(&mut self)).collect();
             if !step_task.is_empty() || flag.0.load(Ordering::Relaxed) {
@@ -340,6 +358,7 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
                 continue; // shortcut, advance tasks as soon as possible
             }
             // step 3, deliver all "arrived" messages
+            // helper that adjusts `msg_queue.peek()` and `timeout_queue.peek()`
             let flush = |msg_queue: &mut BinaryHeap<_>, this: &mut Self| {
                 msg_queue.extend(this.msg_out.try_iter().map(Reverse));
                 while this
@@ -359,11 +378,11 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
             {
                 let Reverse(envelop) = msg_queue.pop().unwrap();
                 assert!(self.now <= envelop.delivered);
+                self.now = envelop.delivered;
                 debug!(
                     "[now = {}] {} -> {}: {:?}",
                     self.now, &envelop.src, &envelop.dst, &envelop.msg
                 );
-                self.now = envelop.delivered;
                 self.whoami = Some(envelop.dst);
                 // maybe i am the only one on this planet
                 // to be such a crazy guy:)
@@ -371,11 +390,10 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
                     RecvState::Client(_) => <Self as Recv<P, A, { Role::Client as u8 }>>::recv_msg,
                     RecvState::Server(_) => <Self as Recv<P, A, { Role::Server as u8 }>>::recv_msg,
                 })(&mut self, &envelop.src, envelop.msg);
-                msg_queue.extend(self.msg_out.try_iter().map(Reverse));
                 flush(&mut msg_queue, &mut self);
             }
             if flag.0.load(Ordering::Relaxed) {
-                continue; // same shortcut
+                continue; // same shortcut to the one in step 2
             }
             // step 4, deliver next timeout
             if let Some(Reverse(timeout)) = self.timeout_queue.pop() {
