@@ -1,8 +1,10 @@
 //!
+use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::future::Future;
 use std::marker::PhantomData;
-use std::net::UdpSocket;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::process::abort;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,23 +21,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::*;
 
+pub type Addr = SocketAddr;
 pub struct Engine<P, App, const ROLE: u8>
 where
     RecvT<Self, P, App>: Tag<ROLE>,
 {
     _p: PhantomData<(P, App)>,
-    config: Config,
+    config: Config<Addr>,
 
     recv: <RecvT<Self, P, App> as Tag<ROLE>>::State,
     socket: UdpSocket,
-    addr: SocketAddr,
+    addr: Addr,
     interrupt: Arc<AtomicBool>,
 
     timeout_queue: BinaryHeap<Reverse<TimeoutState<Self>>>,
     enable_set: HashSet<Timeout>,
     last_timeout: Timeout,
-    #[allow(dead_code)]
-    upkeep: Handle,
 }
 pub trait Tag<const ROLE: u8> {
     type State;
@@ -61,20 +62,24 @@ impl<P, A, const R: u8> Engine<P, A, R>
 where
     RecvT<Self, P, A>: Tag<R>,
 {
-    pub fn new_client(config: Config, host: IpAddr) -> Self
+    pub fn new_client(config: Config<Addr>, host: IpAddr, interrupt: Arc<AtomicBool>) -> Self
     where
         P: Protocol<Self, A, Client = <RecvT<Self, P, A> as Tag<R>>::State>,
         P::Client: ClientState,
     {
         let socket = UdpSocket::bind(SocketAddr::new(host, 0)).unwrap();
-        info!("bind client to {}", socket.local_addr().unwrap());
-        Self::new(config, P::Client::default(), socket)
+        let client = P::Client::default();
+        info!(
+            "bind client, name = {:?}: {}",
+            client.borrow(),
+            socket.local_addr().unwrap()
+        );
+        Self::new(config, client, socket, interrupt)
     }
-    pub fn new_server(config: Config, replica: ReplicaState<A>) -> Self
+    pub fn new_server(config: Config<Addr>, replica: Replica<A>) -> Self
     where
         P: Protocol<Self, A, Server = <RecvT<Self, P, A> as Tag<R>>::State>,
         P::Server: ServerState<A>,
-        A: AppMeta,
     {
         let socket = UdpSocket::bind(config.replica_list[replica.index as usize]).unwrap();
         info!(
@@ -82,22 +87,16 @@ where
             replica.index,
             socket.local_addr().unwrap()
         );
-        Self::new(config, P::Server::from(replica), socket)
+        Self::new(config, P::Server::from(replica), socket, create_interrupt())
     }
-    fn new(config: Config, recv: <RecvT<Self, P, A> as Tag<R>>::State, socket: UdpSocket) -> Self {
-        let interrupt = Arc::new(AtomicBool::new(false));
-        let flag = interrupt.clone();
-        set_handler(move || {
-            println!();
-            if flag.load(Ordering::Relaxed) {
-                error!("program not respond");
-                abort();
-            }
-            info!("interrupted");
-            flag.store(true, Ordering::Relaxed);
-        })
-        .unwrap();
-        let this = Self {
+    fn new(
+        config: Config<Addr>,
+        recv: <RecvT<Self, P, A> as Tag<R>>::State,
+        socket: UdpSocket,
+        interrupt: Arc<AtomicBool>,
+    ) -> Self {
+        socket.set_nonblocking(true).unwrap();
+        Self {
             _p: PhantomData,
             config,
             recv,
@@ -107,14 +106,31 @@ where
             timeout_queue: BinaryHeap::new(),
             enable_set: HashSet::new(),
             last_timeout: 0,
-            upkeep: Upkeep::new(Duration::from_millis(1)).start().unwrap(),
-        };
-        // sometime upkeep's `start` return too early that the underlaying
-        // thread is actually not ready, so block here to wait for it
-        let clock = Clock::new();
-        while clock.recent().as_u64() == 0 {}
-        this
+        }
     }
+}
+
+pub fn create_interrupt() -> Arc<AtomicBool> {
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let flag = interrupt.clone();
+    set_handler(move || {
+        println!();
+        if flag.load(Ordering::Relaxed) {
+            error!("server not respond");
+            abort();
+        }
+        info!("interrupted");
+        flag.store(true, Ordering::Relaxed);
+    })
+    .unwrap();
+    interrupt
+}
+
+pub fn create_upkeep() -> Handle {
+    let upkeep = Upkeep::new(Duration::from_millis(1)).start().unwrap();
+    let clock = Clock::new();
+    while clock.recent().as_u64() == 0 {}
+    upkeep
 }
 
 impl<P: Protocol<Self, A, Client = <RecvT<Self, P, A> as Tag<R>>::State>, A, const R: u8>
@@ -135,32 +151,32 @@ where
         &mut self.recv
     }
 }
-impl<P, A, const R: u8> Borrow<Config> for Engine<P, A, R>
+impl<P, A, const R: u8> Borrow<Config<Addr>> for Engine<P, A, R>
 where
     RecvT<Self, P, A>: Tag<R>,
 {
-    fn borrow(&self) -> &Config {
+    fn borrow(&self) -> &Config<Addr> {
         &self.config
     }
 }
-impl<P, A, const R: u8> Borrow<SocketAddr> for Engine<P, A, R>
+impl<P: Protocol<Self, A>, A, const R: u8> LocalAddr for Engine<P, A, R>
 where
     RecvT<Self, P, A>: Tag<R>,
+    P::Msg: Serialize,
 {
-    fn borrow(&self) -> &SocketAddr {
+    fn local_addr(&self) -> &Self::Addr {
         &self.addr
     }
 }
-
 impl<P: Protocol<Self, A>, A, const R: u8> TransportCore for Engine<P, A, R>
 where
     RecvT<Self, P, A>: Tag<R>,
     P::Msg: Serialize,
 {
     type Msg = P::Msg;
-    fn send_msg(&self, dst: &SocketAddr, msg: Self::Msg) {
-        let buf = serialize(&msg).unwrap();
-        self.socket.send_to(&buf, dst).unwrap();
+    type Addr = Addr;
+    fn send_msg(&self, dst: &Self::Addr, msg: Self::Msg) {
+        self.socket.send_to(&serialize(&msg).unwrap(), dst).unwrap();
     }
 }
 // copied from simulated engine
@@ -192,9 +208,10 @@ impl<P, A, const R: u8> Engine<P, A, R>
 where
     RecvT<Self, P, A>: Tag<R>,
 {
-    pub fn client(&mut self) -> &mut impl Invoke<P>
+    pub fn client(&mut self) -> &mut impl Invoke<P, A>
     where
-        Self: Invoke<P>,
+        Self: Invoke<P, A>,
+        A: App,
     {
         self
     }
@@ -208,31 +225,58 @@ where
     where
         P: Protocol<Self, A>,
         P::Msg: for<'a> Deserialize<'a>,
-        Self: Recv<P, A, R, Msg = P::Msg>,
+        Self: Recv<P, A, R, Msg = P::Msg, Addr = Addr>,
     {
-        self.socket.set_nonblocking(true).unwrap();
         let clock = Clock::new();
+        let mut next_timeout = if let Some(Reverse(timeout)) = self.timeout_queue.peek() {
+            timeout.expire.as_u64()
+        } else {
+            u64::MAX
+        };
+        let mut last_timeout = self.last_timeout;
         while !(self.interrupt.load(Ordering::Relaxed)
             || (R == Role::Client as u8 && wake.load(Ordering::Relaxed)))
         {
             let mut buf = [0; 1500];
+            // fast path: (may) handle received packet and do not set new timeout
             if let Ok((nb_byte, remote)) = self.socket.recv_from(&mut buf) {
                 assert!(nb_byte <= 1500);
                 self.recv_msg(&remote, deserialize(&buf[..nb_byte]).unwrap());
+
+                // fast path skip this branch
+                if self.last_timeout > last_timeout {
+                    // can we assert that no one will ever create a new timeout
+                    // then clear all timeouts immediately? :)
+                    next_timeout = if let Some(Reverse(timeout)) = self.timeout_queue.peek() {
+                        timeout.expire.as_u64()
+                    } else {
+                        u64::MAX
+                    };
+                    last_timeout = self.last_timeout;
+                }
             }
+            assert_ne!(clock.recent().as_u64(), 0);
+            assert!(self.timeout_queue.is_empty() || next_timeout != u64::MAX);
+            if clock.recent().as_u64() < next_timeout {
+                continue; // fast path escape
+            }
+
+            next_timeout = u64::MAX;
             while let Some(Reverse(timeout)) = self.timeout_queue.peek() {
                 if !self.enable_set.contains(&timeout.id) {
                     self.timeout_queue.pop();
                     continue;
                 }
-                assert_ne!(clock.recent().as_u64(), 0);
                 if clock.recent() < timeout.expire {
+                    next_timeout = timeout.expire.as_u64();
                     break;
                 }
                 let Reverse(timeout) = self.timeout_queue.pop().unwrap();
                 self.enable_set.remove(&timeout.id);
                 (timeout.callback)(self);
+                next_timeout = u64::MAX;
             }
+            last_timeout = self.last_timeout;
         }
     }
 }
@@ -250,8 +294,11 @@ where
     where
         P: Protocol<Self, A>,
         P::Msg: for<'a> Deserialize<'a>,
-        Self: Recv<P, A, { Role::Server as u8 }, Msg = P::Msg>,
+        Self: Recv<P, A, { Role::Server as u8 }, Msg = P::Msg, Addr = Addr>,
     {
+        // the passed atomic bool is just a placeholder, should be ignored by
+        // internal loop
+        // so pass a positive flag to make sure that it is ignored indeed
         self.internal_run(&AtomicBool::new(true));
     }
 }
@@ -265,7 +312,7 @@ where
     where
         P: Protocol<Self, A>,
         P::Msg: for<'a> Deserialize<'a>,
-        Self: Recv<P, A, { Role::Client as u8 }, Msg = P::Msg>,
+        Self: Recv<P, A, { Role::Client as u8 }, Msg = P::Msg, Addr = Addr>,
     {
         let wake_flag = Arc::new(FlagWaker(AtomicBool::new(false)));
         let waker = waker_ref(&wake_flag);

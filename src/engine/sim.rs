@@ -1,4 +1,5 @@
 //!
+use std::borrow::{Borrow, BorrowMut};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
@@ -15,9 +16,10 @@ use log::*;
 
 use crate::*;
 
+pub type Addr = String;
 pub struct Engine<P: Protocol<Self, App>, App> {
-    recv_map: HashMap<SocketAddr, RecvState<Self, P, App>>,
-    whoami: Option<SocketAddr>,
+    recv_map: HashMap<Addr, RecvState<Self, P, App>>,
+    whoami: Option<Addr>,
 
     msg_in: Sender<MsgEnvelop<P::Msg>>,
     msg_out: Receiver<MsgEnvelop<P::Msg>>,
@@ -28,7 +30,7 @@ pub struct Engine<P: Protocol<Self, App>, App> {
     enable_set: HashSet<Timeout>,
     last_timeout: Timeout,
 
-    config: Config,
+    config: Config<Addr>,
     step_in: Sender<Step<Self>>,
     step_out: Receiver<Step<Self>>,
     task_list: Vec<LocalBoxFuture<'static, ()>>,
@@ -43,9 +45,9 @@ type Step<E> = Box<dyn FnOnce(&mut E) -> LocalBoxFuture<'static, ()>>;
 #[derivative(Eq, PartialEq, Ord, PartialOrd)]
 pub struct MsgEnvelop<Msg> {
     #[derivative(PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
-    pub src: SocketAddr,
+    pub src: Addr,
     #[derivative(PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
-    pub dst: SocketAddr,
+    pub dst: Addr,
     #[derivative(PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
     pub msg: Msg,
     pub delivered: Millis,
@@ -56,14 +58,14 @@ struct TimeoutState<T> {
     #[derivative(PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
     id: Timeout,
     #[derivative(PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
-    notified: Option<SocketAddr>,
+    notified: Option<Addr>,
     expire: Millis,
     #[derivative(PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
     callback: Box<dyn 'static + FnOnce(&mut T)>,
 }
 
 impl<P: Protocol<Self, A>, A> Engine<P, A> {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config<Addr>) -> Self {
         let (msg_in, msg_out) = channel();
         let (step_in, step_out) = channel();
         Self {
@@ -82,21 +84,20 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
             task_list: Vec::new(),
         }
     }
-    pub fn spawn_client(&mut self, host: IpAddr) -> SocketAddr
+    pub fn spawn_client(&mut self, addr: Addr)
     where
         P::Client: ClientState,
     {
-        let addr = SocketAddr::new(host, self.recv_map.len() as u16 + 10001);
-        self.recv_map
-            .insert(addr, RecvState::Client(P::Client::default()));
-        addr
+        let client = P::Client::default();
+        debug!("spawn client {:?}: bind to {}", client.borrow(), addr);
+        self.recv_map.insert(addr, RecvState::Client(client));
     }
-    pub fn spawn_server(&mut self, replica: ReplicaState<A>)
+    pub fn spawn_server(&mut self, replica: Replica<A>)
     where
         P::Server: ServerState<A>,
-        A: AppMeta,
     {
-        let addr = self.config.replica_list[replica.index as usize];
+        let addr = self.config.replica_list[replica.index as usize].clone();
+        debug!("spawn replica index {}: bind to {}", replica.index, addr);
         self.recv_map
             .insert(addr, RecvState::Server(P::Server::from(replica)));
     }
@@ -104,7 +105,11 @@ impl<P: Protocol<Self, A>, A> Engine<P, A> {
 
 impl<P: Protocol<Self, A>, A> TaggedBorrowMut<P::Client, { Role::Client as u8 }> for Engine<P, A> {
     fn borrow_mut(&mut self) -> &mut P::Client {
-        if let RecvState::Client(state) = self.recv_map.get_mut(&self.whoami.unwrap()).unwrap() {
+        if let RecvState::Client(state) = self
+            .recv_map
+            .get_mut(self.whoami.as_ref().unwrap())
+            .unwrap()
+        {
             state
         } else {
             unreachable!()
@@ -113,20 +118,27 @@ impl<P: Protocol<Self, A>, A> TaggedBorrowMut<P::Client, { Role::Client as u8 }>
 }
 impl<P: Protocol<Self, A>, A> TaggedBorrowMut<P::Server, { Role::Server as u8 }> for Engine<P, A> {
     fn borrow_mut(&mut self) -> &mut P::Server {
-        if let RecvState::Server(state) = self.recv_map.get_mut(&self.whoami.unwrap()).unwrap() {
+        if let RecvState::Server(state) = self
+            .recv_map
+            .get_mut(self.whoami.as_ref().unwrap())
+            .unwrap()
+        {
             state
         } else {
             unreachable!()
         }
     }
 }
-impl<P: Protocol<Self, A>, A> Borrow<Config> for Engine<P, A> {
-    fn borrow(&self) -> &Config {
+impl<P: Protocol<Self, A>, A> Borrow<Config<Addr>> for Engine<P, A> {
+    fn borrow(&self) -> &Config<Addr> {
         &self.config
     }
 }
-impl<P: Protocol<Self, A>, A> Borrow<SocketAddr> for Engine<P, A> {
-    fn borrow(&self) -> &SocketAddr {
+impl<P: Protocol<Self, A>, A> LocalAddr for Engine<P, A>
+where
+    P::Msg: Debug,
+{
+    fn local_addr(&self) -> &Addr {
         self.whoami.as_ref().unwrap()
     }
 }
@@ -136,10 +148,11 @@ where
     P::Msg: Debug,
 {
     type Msg = P::Msg;
-    fn send_msg(&self, dst: &SocketAddr, msg: Self::Msg) {
+    type Addr = Addr;
+    fn send_msg(&self, dst: &Self::Addr, msg: Self::Msg) {
         let mut envelop = MsgEnvelop {
-            src: self.whoami.unwrap(),
-            dst: *dst,
+            src: self.whoami.clone().unwrap(),
+            dst: dst.clone(),
             delivered: self.now,
             msg,
         };
@@ -164,7 +177,7 @@ impl<P: Protocol<Self, A>, A> Timing for Engine<P, A> {
         self.last_timeout += 1;
         self.timeout_queue.push(Reverse(TimeoutState {
             id: self.last_timeout,
-            notified: self.whoami,
+            notified: self.whoami.clone(),
             expire: self.now + duration,
             callback: Box::new(callback),
         }));
@@ -180,20 +193,21 @@ impl<P: Protocol<Self, A>, A> Timing for Engine<P, A> {
 }
 // everything following is exclusive features of simulated engine
 impl<P: Protocol<Self, A>, A> Engine<P, A> {
-    pub fn client(&mut self, addr: &SocketAddr) -> &mut impl Invoke<P>
+    pub fn client(&mut self, addr: &str) -> &mut impl Invoke<P, A>
     where
-        Self: Invoke<P>,
+        Self: Invoke<P, A>,
+        A: App,
     {
-        self.whoami = Some(*addr);
+        self.whoami = Some(addr.to_string());
         self
     }
-    pub fn app(&mut self, index: ReplicaIndex) -> &mut A::State
+    pub fn app(&mut self, index: ReplicaIndex) -> &mut A
     where
-        A: AppMeta,
+        A: App,
         P::Server: ServerState<A>,
     {
-        let addr = self.config.replica_list[index as usize];
-        let state = if let RecvState::Server(state) = self.recv_map.get_mut(&addr).unwrap() {
+        let addr = &self.config.replica_list[index as usize];
+        let state = if let RecvState::Server(state) = self.recv_map.get_mut(addr).unwrap() {
             state
         } else {
             unreachable!()
@@ -261,27 +275,33 @@ impl<E> Spawner<E> {
 impl<P: Protocol<Engine<P, A>, A>, A> Spawner<Engine<P, A>> {
     pub async fn invoke(
         &self,
-        addr: &SocketAddr,
-        op: String,
+        addr: &str,
+        op: A::Op,
         // some kind of stupid...
-    ) -> <Reliable<String> as Future>::Output
+    ) -> <Reliable<A::Res> as Future>::Output
     where
-        Engine<P, A>: Invoke<P>,
+        Engine<P, A>: Invoke<P, A>,
+        A: App,
+        A::Op: 'static,
+        A::Res: 'static,
     {
-        let addr = *addr;
+        let addr = addr.to_string();
         self.spawn(move |engine| engine.client(&addr).invoke(op))
             .await
     }
     pub async fn invoke_unlogged(
         &self,
-        addr: &SocketAddr,
-        op: String,
+        addr: &str,
+        op: A::Op,
         timeout: Millis,
-    ) -> <Unreliable<String> as Future>::Output
+    ) -> <Unreliable<A::Res> as Future>::Output
     where
-        Engine<P, A>: Invoke<P>,
+        Engine<P, A>: Invoke<P, A>,
+        A: App,
+        A::Op: 'static,
+        A::Res: 'static,
     {
-        let addr = *addr;
+        let addr = addr.to_string();
         self.spawn(move |engine| engine.client(&addr).invoke_unlogged(op, timeout))
             .await
     }
@@ -321,8 +341,8 @@ impl ArcWake for FlagWaker {
 impl<P: Protocol<Self, A>, A> Engine<P, A> {
     pub fn run(mut self) -> bool
     where
-        Self: Recv<P, A, { Role::Client as u8 }, Msg = P::Msg>
-            + Recv<P, A, { Role::Server as u8 }, Msg = P::Msg>,
+        Self: Recv<P, A, { Role::Client as u8 }, Msg = P::Msg, Addr = Addr>
+            + Recv<P, A, { Role::Server as u8 }, Msg = P::Msg, Addr = Addr>,
         P::Msg: Debug,
     {
         let mut msg_queue = BinaryHeap::new();
