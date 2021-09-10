@@ -5,20 +5,19 @@ use std::collections::{BinaryHeap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::process::abort;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bincode::{deserialize, serialize};
-use ctrlc::set_handler;
 use derivative::Derivative;
 use futures::task::{waker_ref, ArcWake};
 use log::*;
-use quanta::{Clock, Handle, Instant, Upkeep};
+use quanta::{Clock, Instant};
 use serde::{Deserialize, Serialize};
 
+use crate::util::misc::create_interrupt;
 use crate::*;
 
 pub type Addr = SocketAddr;
@@ -87,7 +86,8 @@ where
             replica.index,
             socket.local_addr().unwrap()
         );
-        Self::new(config, P::Server::from(replica), socket, create_interrupt())
+        let (_, interrupt) = create_interrupt();
+        Self::new(config, P::Server::from(replica), socket, interrupt)
     }
     fn new(
         config: Config<Addr>,
@@ -108,29 +108,6 @@ where
             last_timeout: 0,
         }
     }
-}
-
-pub fn create_interrupt() -> Arc<AtomicBool> {
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let flag = interrupt.clone();
-    set_handler(move || {
-        println!();
-        if flag.load(Ordering::Relaxed) {
-            error!("server not respond");
-            abort();
-        }
-        info!("interrupted");
-        flag.store(true, Ordering::Relaxed);
-    })
-    .unwrap();
-    interrupt
-}
-
-pub fn create_upkeep() -> Handle {
-    let upkeep = Upkeep::new(Duration::from_millis(1)).start().unwrap();
-    let clock = Clock::new();
-    while clock.recent().as_u64() == 0 {}
-    upkeep
 }
 
 impl<P: Protocol<Self, A, Client = <RecvT<Self, P, A> as Tag<R>>::State>, A, const R: u8>

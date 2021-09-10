@@ -1,4 +1,4 @@
-//! `spec` module defines important abstractions and traits, which compose the 
+//! `spec` module defines important abstractions and traits, which compose the
 //! foundation.
 //!
 //! The system follows a 3-layer design: from bottom to top is engine, protocol,
@@ -41,6 +41,7 @@ use std::convert::TryInto;
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::task::{Context, Poll};
 
 pub use futures::channel::oneshot::Canceled;
@@ -50,6 +51,7 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use serde_derive::{Deserialize, Serialize};
+use toml::Value;
 
 pub type OpNum = u64;
 
@@ -115,10 +117,32 @@ pub struct Replica<App> {
 pub trait ServerState<App>: From<Replica<App>> + BorrowMut<Replica<App>> {}
 impl<T: From<Replica<App>> + BorrowMut<Replica<App>>, App> ServerState<App> for T {}
 
+#[derive(Debug, Clone)]
 pub struct Config<Addr> {
     pub f: usize,
     pub replica_list: Vec<Addr>,
     pub multicast: Option<Addr>,
+}
+impl<Addr: FromStr> FromStr for Config<Addr>
+where
+    Addr::Err: Debug,
+{
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value: Value = s.parse().unwrap();
+        Ok(Self {
+            f: value["f"].as_integer().unwrap() as usize,
+            replica_list: value["replica"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|addr| addr.as_str().unwrap().parse().unwrap())
+                .collect(),
+            multicast: value
+                .get("multicast")
+                .map(|multicast| multicast.as_str().unwrap().parse().unwrap()),
+        })
+    }
 }
 
 #[derive(PartialEq, Eq)]
