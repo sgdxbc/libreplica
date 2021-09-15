@@ -7,8 +7,13 @@ mod spec {
 /// At any time top level module does wildcard re-exporting from the latest
 /// version of `spec`. To survive from a breaking change, change `use crate::*`
 /// to `use crate::spec::v1::*`.
+///
+/// Components of the project target to all version of specification. If one
+/// single item cannot co-implement every version, an alternative item will be
+/// provided in the module of old verions of specification.
 pub use spec::v1::*;
 
+pub mod execute;
 pub mod recv {
     pub mod unreplicated;
     pub use unreplicated::Unreplicated;

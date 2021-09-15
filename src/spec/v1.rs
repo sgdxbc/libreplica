@@ -65,6 +65,10 @@ pub trait App: 'static {
     fn replica_upcall(&mut self, op_num: OpNum, op: Self::Op) -> Self::Res;
     fn unlogged_upcall(&mut self, op: Self::Op) -> Self::Res;
 }
+pub trait RollbackApp: App {
+    fn rollback_upcall(&mut self, to: OpNum, op_iter: impl Iterator<Item = (OpNum, Self::Op)>);
+    fn commit_upcall(&mut self, to: OpNum);
+}
 /// The "ghost" meta-type for protocol implementation, i.e. a group of receivers
 /// including client, server, etc. Engines are generic over `Protocol` instead
 /// of contained receiver states, which normally take the engine type as generic

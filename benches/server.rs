@@ -27,12 +27,12 @@ fn main() {
         (@arg _bench: --bench)
     )
     .get_matches();
-    fn parse<T>(matches: &ArgMatches, key: &str, desc: &str) -> T
+    fn parse<T>(matches: &ArgMatches, key: &str, invariant: &str) -> T
     where
         T: FromStr,
         T::Err: Debug,
     {
-        matches.value_of(key).unwrap().parse().expect(desc)
+        matches.value_of(key).unwrap().parse().expect(invariant)
     }
     let config = read_to_string(parse::<String>(&matches, "config", "path to config file"))
         .unwrap()

@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::fmt::Debug;
 use std::fs::read_to_string;
 use std::iter::repeat;
@@ -35,15 +36,15 @@ fn main() {
         (@arg _bench: --bench)
     )
     .get_matches();
-    fn parse<T>(matches: &ArgMatches, key: &str, desc: &str) -> T
+    fn parse<T>(matches: &ArgMatches, key: &str, invariant: &str) -> T
     where
         T: FromStr,
         T::Err: Debug,
     {
-        matches.value_of(key).unwrap().parse().expect(desc)
+        matches.value_of(key).unwrap().parse().expect(invariant)
     }
     let nb_client: usize = parse(&matches, "nb_client", "number of client");
-    let duration = parse(&matches, "duration", "request duration");
+    let mut duration = parse::<u64>(&matches, "duration", "request duration") * 1000;
     let host = parse(&matches, "host", "host ip address");
     let config = read_to_string(parse::<String>(&matches, "config", "path to config file"))
         .unwrap()
@@ -88,7 +89,10 @@ fn main() {
                     if let Err(_) = engine.wait(pending) {
                         return latency_list;
                     }
-                    latency_list.push(clock.delta(start, clock.end()).as_micros());
+                    latency_list.push(min(
+                        clock.delta(start, clock.end()).as_micros(),
+                        u16::MAX.into(),
+                    ) as u16);
                 }
             })
         })
@@ -103,7 +107,7 @@ fn main() {
     }
     let start = clock.start();
     if signal
-        .wait_timeout_while(guard, Duration::from_secs(duration), |_| {
+        .wait_timeout_while(guard, Duration::from_millis(duration), |_| {
             !flag.load(Ordering::Relaxed)
         })
         .unwrap()
@@ -111,9 +115,15 @@ fn main() {
         .timed_out()
     {
         // this is expected not to last long
-        while clock.delta(start, clock.end()).as_secs_f64() < duration as f64 {}
-        info!("time up, main thread send interrupt");
-        flag.store(true, Ordering::Relaxed);
+        while clock.delta(start, clock.end()).as_millis() < duration.into()
+            && !flag.load(Ordering::Relaxed)
+        {}
+        if !flag.load(Ordering::Relaxed) {
+            info!("time up, main thread send interrupt");
+            flag.store(true, Ordering::Relaxed);
+        }
+    } else {
+        duration = clock.delta(start, clock.end()).as_millis() as u64;
     }
     assert!(flag.load(Ordering::Relaxed));
 
@@ -122,18 +132,23 @@ fn main() {
         .map(|h| h.join().unwrap())
         .flatten()
         .collect();
-    std::thread::sleep(Duration::from_secs(1));
-
     info!(
         "throughput: {} ops/sec",
-        latency_list.len() as u64 / duration
+        latency_list.len() as u64 * 1000 / duration
     );
     if !latency_list.is_empty() {
         latency_list.sort_unstable();
+        fn fmt_latency(latency: u16) -> String {
+            if latency == u16::MAX {
+                ">=65536 us".to_string()
+            } else {
+                format!("{} us", latency)
+            }
+        }
         info!(
-            "latency: {} us (medium) / {} us (99th)",
-            latency_list[latency_list.len() / 2],
-            latency_list[(latency_list.len() as f64 * 0.99) as usize]
+            "latency: {} (medium) / {} (99th)",
+            fmt_latency(latency_list[latency_list.len() / 2]),
+            fmt_latency(latency_list[(latency_list.len() as f64 * 0.99) as usize])
         )
     }
 }
